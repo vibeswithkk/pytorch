@@ -7934,6 +7934,10 @@ class FallbackKernel(ExternKernelAlloc):
 
         if not V.graph.aot_mode:
             # No need to serialize in the cpp wrapper JIT mode
+            # For HOPs (HigherOrderOperator), include kwargs as a separate dict
+            # since they may not have ordered_kwargs_for_cpp_kernel
+            if isinstance(target, torch._ops.HigherOrderOperator):
+                return (args, kwargs)
             return [*args, *ordered_kwargs]
 
         serializer = GraphModuleSerializer(None, [])  # type: ignore[arg-type]
@@ -8168,6 +8172,7 @@ class FallbackKernel(ExternKernelAlloc):
                 tensor_args,
                 non_tensor_args,
                 unflatten_args,
+                kwargs=kwargs,
                 unbacked_bindings=unbacked_bindings,
             )
 
@@ -8179,6 +8184,7 @@ class FallbackKernel(ExternKernelAlloc):
                 tensor_args,
                 non_tensor_args,
                 unflatten_args,
+                kwargs=kwargs,
                 unbacked_bindings=unbacked_bindings,
             )
 
