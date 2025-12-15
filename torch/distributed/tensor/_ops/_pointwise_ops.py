@@ -12,6 +12,7 @@ from torch.distributed.tensor._op_schema import (
     StrategyType,
     TupleStrategy,
 )
+from torch.distributed.tensor._ops._math_ops import _NormPartial
 from torch.distributed.tensor._ops.registration import register_op_strategy
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
@@ -569,7 +570,19 @@ def common_pointwise_strategy(
                     out_placements.append(Shard(new_shard_dim))
             elif isinstance(placement, Partial):
                 is_scalar_arg = any(isinstance(arg, _Number) for arg in args_schema)
-                keep_partial = op not in redistribute_partial_ops or not is_scalar_arg
+                keep_partial = False
+                keep_norm_partial = False
+
+                if isinstance(placement, _NormPartial):
+                    keep_norm_partial = (
+                        op in norm_partial_avoidable_redistribute_ops
+                        and args_schema[1] >= 0  # pyre-ignore[unsupported-operation]
+                    )
+
+                elif isinstance(placement, Partial):
+                    keep_partial = (
+                        op not in redistribute_partial_ops or not is_scalar_arg
+                    )
 
                 # Check if this partial type should be preserved
                 if preserve_partial is not None and placement.is_partial(
@@ -580,7 +593,7 @@ def common_pointwise_strategy(
                 elif (
                     linearity >= 0
                     and (placement.is_partial("sum") or placement.is_partial("avg"))
-                    and keep_partial
+                    and (keep_partial or keep_norm_partial)
                 ):
                     # propagate the partial placement
                     out_placements.append(placement)
@@ -682,10 +695,22 @@ def common_pointwise_strategy(
 
 redistribute_partial_ops = {aten.add.Tensor, aten.add_.Tensor}
 
+norm_partial_avoidable_redistribute_ops = {
+    aten.div.Scalar,
+    aten.div_.Scalar,
+    aten.mul.Scalar,
+    aten.mul_.Scalar,
+}
+
 for op in linear_pointwise_ops:
-    register_op_strategy(op, schema_info=RuntimeSchemaInfo(static_kwargkey=["out"]))(
-        linear_pointwise_strategy
-    )
+    if op in norm_partial_avoidable_redistribute_ops:
+        register_op_strategy(
+            op, schema_info=RuntimeSchemaInfo(1, static_kwargkey=["out"])
+        )(linear_pointwise_strategy)
+    else:
+        register_op_strategy(
+            op, schema_info=RuntimeSchemaInfo(static_kwargkey=["out"])
+        )(linear_pointwise_strategy)
 
 for op in partial_preserving_ops:
     register_op_strategy(op, schema_info=RuntimeSchemaInfo(static_kwargkey=["out"]))(
