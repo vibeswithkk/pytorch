@@ -158,6 +158,16 @@ class PythonFile:
 
         return blocks(self)
 
+    @cached_property
+    def blocks_by_line_number(self) -> dict[int, Block]:
+        # Lines that don't appear are in the top-level scope
+        # Later blocks correctly overwrite earlier, parent blocks.
+        return {i: b for b in self.blocks for i in b.line_range}
+
+    def block_name(self, line: int) -> str:
+        block = self.blocks_by_line_number.get(line)
+        return block.full_name if block else ""
+
 
 class OmittedLines:
     """Read lines textually and find comment lines that end in 'noqa {linter_name}'"""
