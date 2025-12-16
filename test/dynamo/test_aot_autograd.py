@@ -336,15 +336,19 @@ class AotAutogradFallbackTests(torch._inductor.test_case.TestCase):
         self.assertEqual(cc.frame_count, 1)
         self.assertTrue(failure_reason is None)
 
+    @torch._dynamo.config.patch(trace_autograd_ops=True)
     def test_double_backward_errors(self):
         # Remove this test after we get double backward to actually work
         for grad_output in (torch.tensor(1.0, requires_grad=True), None):
             x = torch.tensor(1.0, requires_grad=True)
             err = "torch.compile with aot_autograd does not currently support double backward"
 
-            # The following cases should be equivalent:
+            # Cases (1) and (2) now cause graph breaks (not RuntimeError) because
+            # autograd.grad is traced and outputs requiring grad are detected early.
+            # This causes fallback to eager mode where double backward works fine.
 
             # (1) double backward entirely inside compiled function
+            # Now causes graph break and falls back to eager (no error)
             def f1(x):
                 y = x.sin().exp()
                 (gx,) = torch.autograd.grad(
@@ -355,10 +359,12 @@ class AotAutogradFallbackTests(torch._inductor.test_case.TestCase):
 
             compiled_f1 = torch.compile(backend="aot_eager")(f1)
             f1(x)
-            with self.assertRaisesRegex(RuntimeError, err):
-                compiled_f1(x)
+            # Graph break happens, falls back to eager which works
+            result = compiled_f1(x)
+            self.assertEqual(result, f1(x))
 
             # (2) the second half of double backward outside compiled function
+            # Now causes graph break and falls back to eager (no error)
             def f2(x):
                 y = x.sin().exp()
                 (gx,) = torch.autograd.grad(
@@ -368,10 +374,12 @@ class AotAutogradFallbackTests(torch._inductor.test_case.TestCase):
 
             compiled_f2 = torch.compile(backend="aot_eager")(f2)
             gx = compiled_f2(x)
-            with self.assertRaisesRegex(RuntimeError, err):
-                torch.autograd.grad(gx, x)
+            # Falls back to eager, so this works now
+            torch.autograd.grad(gx, x)
 
             # (3) double backward entirely outside compiled function
+            # This still raises RuntimeError because autograd.grad is outside
+            # the compiled function, so the graph break detection doesn't apply.
             def f3(x):
                 y = x.sin().exp()
                 return y

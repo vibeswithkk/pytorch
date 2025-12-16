@@ -42,6 +42,7 @@ import torch.fx
 import torch.nn
 from torch._guards import TracingContext
 from torch._logging import warning_once
+from torch.autograd.graph import GradientEdge
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass_type
 
 from .. import config, graph_break_hints, polyfills, variables
@@ -79,7 +80,7 @@ from .ctx_manager import (
 from .dicts import ConstDictVariable
 from .distributed import DistributedVariable, ProcessGroupVariable
 from .functions import bind_args_cached, NestedUserFunctionVariable
-from .lists import ListVariable, TupleVariable
+from .lists import ListVariable, NamedTupleVariable, TupleVariable
 from .torch_function import (
     can_dispatch_torch_function,
     dispatch_torch_function,
@@ -591,6 +592,16 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
 
         @register(torch.ops.inductor.accumulate_grad_.default)
         def handle_accumulate_grad_(self, tx: "InstructionTranslator", *args, **kwargs):
+            # Check if gradient is sparse - sparse gradients are not supported
+            if len(args) >= 2:
+                grad_var = args[1]
+                if getattr(grad_var, "is_sparse", False):
+                    unimplemented(
+                        gb_type="sparse_grad_accumulate_grad",
+                        context="accumulate_grad_ with sparse gradient",
+                        explanation="Sparse gradients are not supported in compiled autograd",
+                        hints=[],
+                    )
             return tx.inline_user_function_return(
                 VariableTracker.build(tx, polyfills.accumulate_grad), args, kwargs
             )
@@ -1476,6 +1487,177 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 ),
             )
 
+        @register(torch.autograd.grad)
+        def handle_autograd_grad(self, tx: "InstructionTranslator", *args, **kwargs):
+            """
+            Handle torch.autograd.grad() calls within compiled regions.
+
+            Steps:
+            1. Graph break if compiled_autograd is enabled
+            2. Graph break if graph inputs with external grad_fn are reachable from autograd.grad args
+            3. Track input nodes for later output validation
+            4. Create proxy and track autograd.grad node
+            """
+            from .. import compiled_autograd, graph_break_hints
+            from .builder import wrap_fx_proxy
+            from .lazy import LazyVariableTracker
+            from .lists import BaseListVariable
+            from .tensor import TensorVariable
+
+            # Graph break if compiled_autograd is enabled.
+            # Compiled autograd has limitations (e.g., view_fn in CopySlices)
+            # that would cause errors during fake tensor execution.
+            if compiled_autograd.compiled_autograd_enabled:
+                unimplemented(
+                    gb_type="autograd.grad with compiled autograd",
+                    context="compiled_autograd is currently enabled",
+                    explanation=(
+                        "torch.autograd.grad() inside torch.compile is not supported when "
+                        "compiled autograd is enabled. These two features have conflicting "
+                        "requirements for how the autograd graph is traced."
+                    ),
+                    hints=[
+                        "Disable compiled autograd by removing the compiled_autograd context manager.",
+                        "Or move the autograd.grad() call outside the torch.compile region.",
+                        "Or restructure your code so autograd.grad() and compiled_autograd don't overlap.",
+                    ],
+                )
+
+            # Graph break if graph inputs with external grad_fn are reachable from autograd.grad args.
+            # We can't trace through external grad_fn since it's not in our FX graph.
+
+            def check_for_gradient_edge(var, arg_name="argument"):
+                """Check if var contains a GradientEdge from outside the compiled region."""
+                if (
+                    isinstance(var, NamedTupleVariable)
+                    and var.tuple_cls is GradientEdge
+                ):
+                    # Try to get source info for context
+                    source_info = var.source.name if var.source else None
+                    context = f"GradientEdge in {arg_name}"
+                    if source_info:
+                        context += f": {source_info}"
+
+                    unimplemented(
+                        gb_type="autograd.grad with external GradientEdge",
+                        context=context,
+                        explanation=(
+                            "torch.autograd.grad() cannot be used with GradientEdge inputs "
+                            "passed from outside the compiled region. The GradientEdge contains "
+                            "a reference to an autograd node that was created before torch.compile "
+                            "started tracing, so Dynamo cannot trace through its computation."
+                        ),
+                        hints=[
+                            "Create the GradientEdge inside the compiled function instead of passing it in.",
+                            "Or move the autograd.grad() call outside the torch.compile region.",
+                            "Or use tensor inputs directly instead of GradientEdge objects.",
+                            *graph_break_hints.SUPPORTABLE,
+                        ],
+                    )
+                elif isinstance(var, BaseListVariable):
+                    for i, item in enumerate(var.items):
+                        check_for_gradient_edge(item, f"{arg_name}[{i}]")
+
+            # Check outputs and inputs args
+            if len(args) >= 1:
+                check_for_gradient_edge(args[0], "outputs")
+            if len(args) >= 2:
+                check_for_gradient_edge(args[1], "inputs")
+
+            # Collect external grad_fn objects from graph inputs, along with their sources
+            external_grad_fns: set[torch.autograd.graph.Node] = set()
+            # Map grad_fn -> source name for better error messages
+            grad_fn_to_source: dict[torch.autograd.graph.Node, str] = {}
+            for var in tx.output.input_source_to_var.values():
+                if isinstance(var, TensorVariable) and var.has_grad_fn:
+                    # Get the fake tensor's grad_fn - this represents the external grad_fn
+                    fake_tensor = var.as_proxy().node.meta.get("example_value")
+                    if fake_tensor is not None and fake_tensor.grad_fn is not None:
+                        external_grad_fns.add(fake_tensor.grad_fn)
+                        # Track source name for error messages
+                        if var.source is not None:
+                            grad_fn_to_source[fake_tensor.grad_fn] = var.source.name
+
+            def collect_tensors_with_sources(var):
+                """Extract (fake_tensor, source_name) pairs from a VariableTracker."""
+                results = []
+                if isinstance(var, TensorVariable):
+                    fake_tensor = var.as_proxy().node.meta.get("example_value")
+                    if fake_tensor is not None:
+                        source_name = var.source.name if var.source else None
+                        results.append((fake_tensor, source_name))
+                elif isinstance(var, LazyVariableTracker):
+                    # Realize the lazy var to get the actual TensorVariable
+                    results.extend(collect_tensors_with_sources(var.realize()))
+                elif isinstance(var, BaseListVariable):
+                    for item in var.items:
+                        results.extend(collect_tensors_with_sources(item))
+                return results
+
+            # Check if external grad_fns are reachable from autograd.grad args
+            from ..output_graph import find_reachable_grad_fn
+
+            outputs_with_sources = (
+                collect_tensors_with_sources(args[0]) if len(args) >= 1 else []
+            )
+            inputs_with_sources = (
+                collect_tensors_with_sources(args[1]) if len(args) >= 2 else []
+            )
+
+            for tensors_with_sources, arg_name in [
+                (outputs_with_sources, "outputs"),
+                (inputs_with_sources, "inputs"),
+            ]:
+                for tensor, tensor_source in tensors_with_sources:
+                    reachable_grad_fn = find_reachable_grad_fn(tensor, external_grad_fns)
+                    if reachable_grad_fn is not None:
+                        # Build context with specific information
+                        input_source = grad_fn_to_source.get(reachable_grad_fn)
+                        context_parts = []
+                        if tensor_source:
+                            context_parts.append(f"{arg_name} tensor: {tensor_source}")
+                        if input_source:
+                            context_parts.append(
+                                f"input with external grad_fn: {input_source}"
+                            )
+                        context = ", ".join(context_parts)
+
+                        unimplemented(
+                            gb_type="autograd.grad with external grad_fn",
+                            context=context,
+                            explanation=(
+                                f"torch.autograd.grad() cannot trace through the autograd graph because "
+                                f"the '{arg_name}' argument depends on a tensor that was created outside "
+                                f"the compiled region and has a grad_fn attached. The autograd graph "
+                                f"extends beyond the compiled region boundary, which Dynamo cannot trace."
+                            ),
+                            hints=[
+                                f"Detach the input tensor before passing to the compiled function: "
+                                f"`tensor.detach().requires_grad_(True)` to make it a leaf tensor.",
+                                f"Or call `.detach()` on the tensor before using it in autograd.grad().",
+                                f"Or move the autograd.grad() call outside the compiled region.",
+                                *graph_break_hints.SUPPORTABLE,
+                            ],
+                        )
+
+            # Extract just the tensors for tracking (without sources)
+            outputs_tensors = [t for t, _ in outputs_with_sources]
+
+            # Track the outputs arg grad_fns for later validation
+            # (to detect returning tensors whose grad_fn was consumed by autograd.grad)
+            for tensor in outputs_tensors:
+                if isinstance(tensor, torch.Tensor) and tensor.grad_fn is not None:
+                    tx.output.autograd_grad_output_grad_fns.add(tensor.grad_fn)
+
+            return wrap_fx_proxy(
+                tx=tx,
+                proxy=tx.output.create_proxy(
+                    "call_function",
+                    torch.autograd.grad,
+                    *proxy_args_kwargs(args, kwargs),
+                ),
+            )
+
         return handlers
 
     def call_function(
@@ -2061,6 +2243,11 @@ For now, dynamo will explicitly graph break when it encounters user code with th
         # grad_enabled. Since this is parameter, we can just override the
         # has_grad_fn field to False to workaround the issue.
         result.has_grad_fn = False  # type: ignore[union-attr]
+
+        # Register this parameter as a leaf tensor for backward() auto-detection.
+        # When backward() is called without inputs, we need to find all leaf tensors,
+        # including those created in-graph like nn.Parameter.
+        tx.output.leaf_var_creation_order.append(result)
 
         # TODO(jansel): if the new param falls out of scope, currently it won't get freed until
         # the end of the graph.  We should fix this.
