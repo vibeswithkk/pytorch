@@ -1233,6 +1233,14 @@
   "GB0123": [
     {
       "Gb_type": "Unsupported Tensor.backward() call",
+      "Context": "call_method {self} backward {gradient} {retain_graph} {create_graph} {inputs}",
+      "Explanation": "Dynamo currently does not support tracing `Tensor.backward()`.",
+      "Hints": [
+        "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    },
+    {
+      "Gb_type": "Unsupported Tensor.backward() call",
       "Context": "call_method {self} backward {args} {kwargs}",
       "Explanation": "Dynamo currently does not support tracing `Tensor.backward()`.",
       "Hints": [
@@ -3330,6 +3338,14 @@
       ]
     }
   ],
+  "GB1501": [
+    {
+      "Gb_type": "sparse_grad_accumulate_grad",
+      "Context": "accumulate_grad_ with sparse gradient",
+      "Explanation": "Sparse gradients are not supported in compiled autograd",
+      "Hints": []
+    }
+  ],
   "GB0323": [
     {
       "Gb_type": "torch.scan: improper additional_inputs",
@@ -3836,6 +3852,14 @@
     }
   ],
   "GB0372": [
+    {
+      "Gb_type": "autograd.grad with compiled autograd",
+      "Context": "torch.autograd.grad()",
+      "Explanation": "torch.autograd.grad() inside torch.compile is not supported when compiled autograd is enabled.",
+      "Hints": [
+        "Disable compiled autograd, or move the autograd.grad() call outside the compiled region."
+      ]
+    },
     {
       "Gb_type": "autograd.grad with compiled autograd",
       "Context": "",
