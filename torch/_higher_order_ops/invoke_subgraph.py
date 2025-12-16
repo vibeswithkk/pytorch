@@ -167,6 +167,40 @@ invoke_subgraph = InvokeSubgraphHOP()
 # Registers dispatches for SAC
 redirect_to_mode(invoke_subgraph, _CachingTorchDispatchMode)
 redirect_to_mode(invoke_subgraph, _CachedTorchDispatchMode)
+from torch.utils._debug_mode import (
+    DebugMode,
+    register_debug_mode_log_hook,
+    register_debug_mode_pre_log_hook,
+)
+
+
+# redirect_to_mode(invoke_subgraph, DebugMode)
+
+_invoke_subgraph_debug_mode_stack = []
+
+
+@register_debug_mode_pre_log_hook
+def invoke_subgraph_dispatch_pre_hook(func, types, args, kwargs, result, debug_mode):
+    if func is torch._higher_order_ops.invoke_subgraph:
+        subgraph_name = args[1]
+        debug_mode.call_depth += 1
+        debug_mode._handle_annotate(f"[enter InvokeSubgraph HOP] {subgraph_name}")
+        debug_mode.call_depth -= 1
+        global _invoke_subgraph_debug_mode_stack
+        _invoke_subgraph_debug_mode_stack.append(debug_mode)
+        return None
+
+
+@register_debug_mode_log_hook
+def invoke_subgraph_dispatch_hook(func, types, args, kwargs, result, debug_mode):
+    if func is torch._higher_order_ops.invoke_subgraph:
+        subgraph_name = args[1]
+        debug_mode.call_depth += 1
+        debug_mode._handle_annotate(f"[exit InvokeSubgraph HOP] {subgraph_name}")
+        debug_mode.call_depth -= 1
+        global _invoke_subgraph_debug_mode_stack
+        _invoke_subgraph_debug_mode_stack.pop()
+        return None
 
 
 def invoke_subgraph_placeholder(func, *args, **kwargs):
@@ -654,16 +688,41 @@ def _(subgraph, identifier, *operands):
     return autograd_fn_callable(*operands)
 
 
+@contextlib.contextmanager
+def _push_mode_temporarily(mode):
+    """
+    Can only be used when _get_current_dispatch_mode() is empty
+    """
+    from torch.utils._python_dispatch import _pop_mode, _push_mode
+
+    try:
+        _push_mode(mode)
+        yield
+    finally:
+        _pop_mode()
+
+
 @invoke_subgraph.py_impl(DispatchKey.CompositeExplicitAutograd)
 def _(subgraph, identifier, *operands):
     from torch.utils._python_dispatch import _get_current_dispatch_mode
 
     mode = _get_current_dispatch_mode()
     assert mode is None, "Mode should never be enabled for CPU/CUDA key"
-    if getattr(subgraph, "_boxed_call", False):
-        return subgraph(list(operands))
-    else:
-        return subgraph(*operands)
+
+    ctx = nullcontext()
+    global _invoke_subgraph_debug_mode_stack
+    turn_on_debug_mode = len(_invoke_subgraph_debug_mode_stack) > 0
+    if turn_on_debug_mode:
+        debug_mode = _invoke_subgraph_debug_mode_stack[-1]
+        assert isinstance(debug_mode, DebugMode)
+        ctx = _push_mode_temporarily(debug_mode)
+
+    with ctx:
+        if getattr(subgraph, "_boxed_call", False):
+            result = subgraph(list(operands))
+        else:
+            result = subgraph(*operands)
+    return result
 
 
 @invoke_subgraph.py_functionalize_impl

@@ -63,7 +63,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-__all__ = ["DebugMode", "get_active_debug_mode"]
+__all__ = [
+    "DebugMode",
+    "get_active_debug_mode",
+    "register_debug_mode_pre_log_hook",
+    "register_debug_mode_log_hook",
+]
 
 
 REDISTRIBUTE_FUNC = "redistribute_input"
@@ -81,6 +86,50 @@ _RECORD_TRITON_OUTPUTS = False
 _TRITON_OUTPUT_HASH_FN = None
 # Annotates kernel input hashes, and stores them in call.pre_hashes
 _TRITON_INPUT_HASH_FN = None
+
+
+def register_debug_mode_pre_log_hook(hook: Callable) -> Callable:
+    """
+    Decorator to register a pre-log hook that will be called before each dispatched operation.
+
+    The hook signature should be: (func, types, args, kwargs, call, debug_mode) -> dict | None
+
+    Pre-log hooks are executed before the operation runs, allowing you to capture state
+    before any in-place mutations occur.
+
+    Example::
+
+        @register_debug_mode_pre_log_hook
+        def my_pre_hook(func, types, args, kwargs, call, debug_mode):
+            # Access debug_mode instance
+            debug_mode.operators.append(...)
+            return {"my_key": "my_value"}  # Will be stored in call.log
+    """
+    global _DISPATCH_PRE_LOG_HOOKS
+    _DISPATCH_PRE_LOG_HOOKS.append(hook)
+    return hook
+
+
+def register_debug_mode_log_hook(hook: Callable) -> Callable:
+    """
+    Decorator to register a log hook that will be called after each dispatched operation.
+
+    The hook signature should be: (func, types, args, kwargs, result, debug_mode) -> dict | None
+
+    Log hooks are executed after the operation completes. The return value is stored in
+    call.log and will be annotated in debug_string() output.
+
+    Example::
+
+        @register_debug_mode_log_hook
+        def my_log_hook(func, types, args, kwargs, result, debug_mode):
+            # Access debug_mode instance
+            num_ops = len(debug_mode.operators)
+            return {"op_count": num_ops}  # Will be stored in call.log
+    """
+    global _DISPATCH_LOG_HOOKS
+    _DISPATCH_LOG_HOOKS.append(hook)
+    return hook
 
 
 def _stringify_shape(shape) -> str:
@@ -155,6 +204,9 @@ def _arg_to_str(arg, attributes, tensor_memo=None) -> str:
             return _tensor_debug_string(x, attributes, tensor_memo)
         elif isinstance(x, DTensorSpec):
             return _stringify_dtensor_spec(x)
+        elif isinstance(x, torch.fx.GraphModule):
+            # don't log the full graph because it can be spammy
+            return f"GraphModule({x.__class__.__name__})"
         return x
 
     arg = tree_map(to_str, arg)
@@ -610,11 +662,13 @@ def _run_hook(hook, *args):
     return out
 
 
-def _run_dispatch_pre_log_hooks(call: _DebugCall, func, types, args, kwargs) -> None:
+def _run_dispatch_pre_log_hooks(
+    call: _DebugCall, func, types, args, kwargs, debug_mode: "DebugMode"
+) -> None:
     global _DISPATCH_PRE_LOG_HOOKS
     if _DISPATCH_PRE_LOG_HOOKS:
         for hook in _DISPATCH_PRE_LOG_HOOKS:
-            hook_out = _run_hook(hook, func, types, args, kwargs, call)
+            hook_out = _run_hook(hook, func, types, args, kwargs, call, debug_mode)
             if hook_out is not None:
                 # Store pre-hook results in call.log
                 if call.log is None:
@@ -622,12 +676,14 @@ def _run_dispatch_pre_log_hooks(call: _DebugCall, func, types, args, kwargs) -> 
                 call.log.update(hook_out)
 
 
-def _run_dispatch_hooks(call: _DebugCall, func, types, args, kwargs, result) -> None:
+def _run_dispatch_hooks(
+    call: _DebugCall, func, types, args, kwargs, result, debug_mode: "DebugMode"
+) -> None:
     global _DISPATCH_RECORD_HOOKS, _DISPATCH_LOG_HOOKS
     if _DISPATCH_RECORD_HOOKS:
         record = {}
         for hook in _DISPATCH_RECORD_HOOKS:
-            hook_out = _run_hook(hook, func, types, args, kwargs, result)
+            hook_out = _run_hook(hook, func, types, args, kwargs, result, debug_mode)
             if hook_out is not None:
                 record.update(hook_out)
         if record:
@@ -638,7 +694,7 @@ def _run_dispatch_hooks(call: _DebugCall, func, types, args, kwargs, result) -> 
         if call.log is None:
             call.log = {}
         for hook in _DISPATCH_LOG_HOOKS:
-            hook_out = _run_hook(hook, func, types, args, kwargs, result)
+            hook_out = _run_hook(hook, func, types, args, kwargs, result, debug_mode)
             if hook_out is not None:
                 call.log.update(hook_out)
 
@@ -872,12 +928,12 @@ class DebugMode(TorchDispatchMode):
         # We have to run becore the func() call in case there's any
         # in-place mutation
         if call:
-            _run_dispatch_pre_log_hooks(call, func, types, args, kwargs)
+            _run_dispatch_pre_log_hooks(call, func, types, args, kwargs, self)
 
         result = func(*args, **kwargs)
         if call:
             self._record_call_output(call, result)
-            _run_dispatch_hooks(call, func, types, args, kwargs, result)
+            _run_dispatch_hooks(call, func, types, args, kwargs, result, self)
 
         return result
 
@@ -1021,14 +1077,14 @@ class DebugMode(TorchDispatchMode):
     ):
         """
         Allows installing post-hooks on arguments to intercepted __torch_dispatch__ calls;
-        hook signatures are expected as (func, types, args, kwargs, result),
-        i.e. __torch_dispatch__ args + return value.
+        hook signatures are expected as (func, types, args, kwargs, result, debug_mode),
+        i.e. __torch_dispatch__ args + return value + debug_mode instance.
 
         Logging hook outputs are stored in call.log and annotate calls in debug_string(),
         while recording hook outputs are just stored in call.record.
         For now hooks are expected to return dictionaries.
 
-        pre_log_hook signature is (func, types, args, kwargs, call) and is executed before
+        pre_log_hook signature is (func, types, args, kwargs, call, debug_mode) and is executed before
         the operation. It allows capturing state before in-place mutations.
         """
         global _DISPATCH_RECORD_HOOKS, _DISPATCH_LOG_HOOKS, _DISPATCH_PRE_LOG_HOOKS
@@ -1056,7 +1112,7 @@ class DebugMode(TorchDispatchMode):
         Hook for storing cloned output tensors in .record["output"].
         """
 
-        def dispatch_hook(func, types, args, kwargs, result):
+        def dispatch_hook(func, types, args, kwargs, result, debug_mode):
             out = tree_map(
                 lambda x: x.clone() if isinstance(x, torch.Tensor) else x, result
             )
@@ -1113,7 +1169,7 @@ class DebugMode(TorchDispatchMode):
                 lambda x: fn(x) if isinstance(x, torch.Tensor) else None, obj
             )
 
-        def _dispatch_pre_log_hook(func, types, args, kwargs, call):
+        def _dispatch_pre_log_hook(func, types, args, kwargs, call, debug_mode):
             """Pre-hook to capture input hashes before operation executes"""
             if "empty" in str(func) or "profiler" in str(func):
                 return None
@@ -1125,7 +1181,7 @@ class DebugMode(TorchDispatchMode):
                     return {"input_hash": input_hash}
             return None
 
-        def _dispatch_post_hook(func, types, args, kwargs, result):
+        def _dispatch_post_hook(func, types, args, kwargs, result, debug_mode):
             """Post-hook to capture output hashes after operation executes"""
             if "empty" in str(func) or "profiler" in str(func):
                 return None
